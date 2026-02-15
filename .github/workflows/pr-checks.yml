@@ -1,0 +1,188 @@
+# Reusable workflow for PR checks
+# Called by: repo/.github/workflows/pr.yml
+#
+# This workflow runs tests on pull requests using the caller repo's
+# local test action at .github/actions/run-tests.
+#
+# Requirements:
+# - Caller repo must have .github/actions/run-tests/action.yml
+# - For version checks: .github/actions/check-versions/action.yml (optional)
+# - For lintian checks: .github/actions/build-deb/action.yml (optional)
+#
+# Version bump check:
+# - Requires VERSION file (repo-level) or apps/ directory (app-level)
+# - Automatically skipped for docs, tests, CI, and tooling changes
+
+name: PR Checks
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: 'Runner to use'
+        required: false
+        default: 'ubuntu-latest'
+        type: string
+      skip-lintian:
+        description: 'Skip lintian checks (for repos without Debian packages)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run tests
+        uses: ./.github/actions/run-tests
+
+  version-check:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check if check-versions action exists
+        id: check-action
+        run: |
+          if [ -f ".github/actions/check-versions/action.yml" ] || [ -f ".github/actions/check-versions/action.yaml" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check version consistency
+        if: steps.check-action.outputs.exists == 'true'
+        uses: ./.github/actions/check-versions
+
+  lintian:
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip-lintian }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check if build-deb action exists
+        id: check-build-deb
+        run: |
+          if [ -f ".github/actions/build-deb/action.yml" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Debian package
+        if: steps.check-build-deb.outputs.exists == 'true'
+        uses: ./.github/actions/build-deb
+
+      - name: Install lintian
+        if: steps.check-build-deb.outputs.exists == 'true'
+        run: sudo apt-get update && sudo apt-get install -y lintian
+
+      - name: Run lintian
+        if: steps.check-build-deb.outputs.exists == 'true'
+        run: |
+          echo "Running lintian on built packages..."
+          failed=0
+          for deb in *.deb; do
+            if [ -f "$deb" ]; then
+              echo ""
+              echo "=== Checking: $deb ==="
+              # Run lintian with informational output, fail on errors and warnings
+              if ! lintian --info --display-info --fail-on error,warning "$deb"; then
+                failed=1
+              fi
+            fi
+          done
+          if [ $failed -eq 1 ]; then
+            echo ""
+            echo "❌ Lintian found issues. See above for details."
+            echo "To suppress specific tags, create debian/<package>.lintian-overrides"
+            exit 1
+          fi
+          echo ""
+          echo "✅ Lintian checks passed"
+
+  version-bump-check:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if version bumps are needed
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          FAILED=0
+
+          git fetch origin "$BASE_REF" --depth=1
+
+          CHANGED_FILES=$(git diff --name-only "origin/${BASE_REF}...HEAD")
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No files changed"
+            exit 0
+          fi
+
+          # --- Part A: App-level version check ---
+          if [ -d "apps" ]; then
+            # Find app directories with changed non-metadata files
+            CHANGED_APP_DIRS=$(echo "$CHANGED_FILES" \
+              | grep -E '^apps/[^/]+/' \
+              | grep -v '/metadata\.yaml$' \
+              | sed 's|^\(apps/[^/]*\)/.*|\1|' \
+              | sort -u || true)
+
+            for app_dir in $CHANGED_APP_DIRS; do
+              if ! echo "$CHANGED_FILES" | grep -q "^${app_dir}/metadata\.yaml$"; then
+                echo "::error::${app_dir}/ was modified but ${app_dir}/metadata.yaml was not updated."
+                echo "  Bump the version field (e.g., 2.20.2-3 -> 2.20.2-4) in ${app_dir}/metadata.yaml"
+                FAILED=1
+              fi
+            done
+          fi
+
+          # --- Part B: Repo-level VERSION check ---
+          if [ -f "VERSION" ]; then
+            # Filter to non-app, package-affecting files (exclude docs, tests,
+            # CI config, dev tooling, and the VERSION file itself)
+            PACKAGE_FILES=$(echo "$CHANGED_FILES" \
+              | grep -v '^apps/' \
+              | grep -v -E '^(VERSION$|.*\.md$|docs/|\.github/|\.devcontainer/|\.vscode/|\.claude/)' \
+              | grep -v -E '^(lefthook\.yml$|\.bumpversion\.cfg$|\.gitignore$|\.editorconfig$|LICENSE)' \
+              | grep -v -E '^(tests?/|__tests__/|e2e/|.*\.test\.[^/]+$|.*\.spec\.[^/]+$)' \
+              | grep -v -E '^(docker/|Dockerfile|docker-compose)' \
+              | grep -v -E '^(tools/|run$|Makefile$|Taskfile\.yml$)' \
+              | grep -v -E '^(store/)' \
+              | grep -v -E '\.(lock)$' \
+              | grep -v -E '\.lintian-overrides$' \
+              || true)
+
+            if [ -n "$PACKAGE_FILES" ]; then
+              if ! echo "$CHANGED_FILES" | grep -q '^VERSION$'; then
+                echo "::error::Package-affecting files changed but VERSION was not bumped."
+                echo ""
+                echo "Changed package files:"
+                echo "$PACKAGE_FILES" | sed 's/^/  /'
+                echo ""
+                echo "Run './run bumpversion patch' (or minor/major) to bump the version."
+                FAILED=1
+              fi
+            fi
+          fi
+
+          if [ $FAILED -eq 1 ]; then
+            exit 1
+          fi
+
+          echo "Version bump check passed"

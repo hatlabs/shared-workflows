@@ -1,0 +1,112 @@
+# Reusable workflow for publishing stable releases
+# Called by: repo/.github/workflows/release.yml
+#
+# Triggered when a draft release is published. Dispatches to APT repository
+# stable channel.
+
+name: Publish Stable Release
+
+on:
+  workflow_call:
+    inputs:
+      apt-distro:
+        description: 'APT distribution (e.g., trixie, bookworm, any)'
+        required: true
+        type: string
+      apt-component:
+        description: 'APT component (e.g., main, hatlabs)'
+        required: true
+        type: string
+      apt-repository:
+        description: 'APT repository to dispatch to'
+        required: false
+        default: 'hatlabs/apt.hatlabs.fi'
+        type: string
+      # Version tag format: v{upstream}+{revision} (e.g., v0.2.0+1 or v1.0.7.2+1)
+      version-pattern:
+        description: 'Regex pattern to validate version tags (must capture upstream and revision)'
+        required: false
+        # Matches both 3-part (1.0.7) and 4-part (1.0.7.2) versions
+        # Note: Uses capturing group instead of (?:) which bash =~ doesn't support
+        # BASH_REMATCH[1]=upstream, [2]=optional 4th part (unused), [3]=revision
+        default: '^v([0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?)\+([0-9]+)$'
+        type: string
+    secrets:
+      APT_REPO_PAT:
+        description: 'PAT for dispatching to APT repository'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch-to-apt:
+    runs-on: ubuntu-latest
+    # Only handle stable releases - pre-releases are handled by build-release.yml
+    if: ${{ github.event.release.prerelease == false }}
+    steps:
+      - name: Extract version info from tag
+        id: version
+        run: |
+          STABLE_TAG="${{ github.event.release.tag_name }}"
+          echo "stable_tag=$STABLE_TAG" >> $GITHUB_OUTPUT
+
+          # Extract upstream and revision from stable tag
+          PATTERN='${{ inputs.version-pattern }}'
+          if [[ $STABLE_TAG =~ $PATTERN ]]; then
+            UPSTREAM="${BASH_REMATCH[1]}"
+            REVISION="${BASH_REMATCH[3]}"
+
+            echo "upstream=$UPSTREAM" >> $GITHUB_OUTPUT
+            echo "revision=$REVISION" >> $GITHUB_OUTPUT
+
+            echo "Stable tag: $STABLE_TAG"
+            echo "Upstream: $UPSTREAM"
+            echo "Revision: $REVISION"
+          else
+            echo "Error: Tag format invalid. Expected pattern: $PATTERN"
+            echo "Got: $STABLE_TAG"
+            exit 1
+          fi
+
+      - name: Verify release has assets
+        run: |
+          STABLE_TAG="${{ steps.version.outputs.stable_tag }}"
+          ASSET_COUNT=$(gh release view "$STABLE_TAG" --repo ${{ github.repository }} --json assets --jq '.assets | length')
+
+          if [ "$ASSET_COUNT" -eq 0 ]; then
+            echo "Error: Release has no assets attached"
+            echo "The .deb package should have been attached when the draft was created"
+            exit 1
+          fi
+
+          echo "Release has $ASSET_COUNT asset(s)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Trigger APT repository
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.APT_REPO_PAT }}
+          repository: ${{ inputs.apt-repository }}
+          event-type: package-updated
+          client-payload: |
+            {
+              "repository": "${{ github.repository }}",
+              "distro": "${{ inputs.apt-distro }}",
+              "channel": "stable",
+              "component": "${{ inputs.apt-component }}"
+            }
+
+      - name: Report success
+        run: |
+          STABLE_TAG="${{ steps.version.outputs.stable_tag }}"
+          UPSTREAM="${{ steps.version.outputs.upstream }}"
+          REVISION="${{ steps.version.outputs.revision }}"
+
+          echo "=== Stable Release Published ==="
+          echo "Stable tag: $STABLE_TAG"
+          echo "Debian version: ${UPSTREAM}-${REVISION}"
+          echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/$STABLE_TAG"
+          echo ""
+          echo "Dispatched to ${{ inputs.apt-repository }} stable channel"

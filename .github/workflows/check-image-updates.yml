@@ -1,0 +1,69 @@
+# Reusable workflow: detect outdated container images in docker-compose files
+# and create/update a PR with the newer versions.
+#
+# Called by: repo/.github/workflows/check-updates.yml
+# Scripts:  scripts/check-image-updates.sh, scripts/create-update-pr.sh
+
+name: Check Container Image Updates
+
+on:
+  workflow_call:
+    inputs:
+      compose-pattern:
+        description: 'Glob for compose files (e.g., docker-compose.yml)'
+        required: true
+        type: string
+      branch-name:
+        description: 'PR branch name'
+        required: false
+        default: 'chore/update-container-images'
+        type: string
+      dry-run:
+        description: 'Log updates without creating a PR'
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      token:
+        description: 'PAT or App token for PR creation (to trigger CI on the PR). Falls back to github.token if not provided, but PRs from github.token will not trigger other workflows.'
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-updates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # github.workflow_ref = "owner/repo/path@refs/heads/branch" — extract the ref
+      # after @ so the scripts checkout matches whichever version the caller pinned.
+      - name: Resolve shared workflow ref
+        id: wf-ref
+        run: echo "ref=${WORKFLOW_REF##*@}" >> "$GITHUB_OUTPUT"
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+
+      - name: Checkout shared scripts
+        uses: actions/checkout@v4
+        with:
+          repository: hatlabs/shared-workflows
+          ref: ${{ steps.wf-ref.outputs.ref }}
+          path: .shared-workflows
+          sparse-checkout: scripts
+
+      - name: Check for image updates
+        id: check
+        env:
+          COMPOSE_PATTERN: ${{ inputs.compose-pattern }}
+        run: bash .shared-workflows/scripts/check-image-updates.sh
+
+      - name: Create or update PR
+        if: steps.check.outputs.has_updates == 'true' && !inputs.dry-run
+        env:
+          GH_TOKEN: ${{ secrets.token || github.token }}
+          BRANCH: ${{ inputs.branch-name }}
+        run: bash .shared-workflows/scripts/create-update-pr.sh

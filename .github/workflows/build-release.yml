@@ -1,0 +1,496 @@
+# Reusable workflow for main branch CI/CD
+# Called by: repo/.github/workflows/main.yml
+#
+# Implements the pr-main-release strategy:
+# 1. Run tests
+# 2. Read version from VERSION file
+# 3. Calculate next revision number from git tags
+# 4. Generate debian/changelog
+# 5. Build .deb package using caller's build action
+# 6. Create pre-release with .deb attached
+# 7. Create draft stable release with .deb attached
+# 8. Dispatch to APT repository unstable channel
+
+name: Build and Release
+
+on:
+  workflow_call:
+    inputs:
+      package-name:
+        description: 'Debian package name (e.g., cockpit-apt)'
+        required: true
+        type: string
+      package-description:
+        description: 'Short description for release notes'
+        required: false
+        default: 'Debian package'
+        type: string
+      apt-distro:
+        description: 'APT distribution (e.g., trixie, bookworm, any)'
+        required: true
+        type: string
+      apt-component:
+        description: 'APT component (e.g., main, hatlabs)'
+        required: true
+        type: string
+      apt-repository:
+        description: 'APT repository to dispatch to'
+        required: false
+        default: 'hatlabs/apt.hatlabs.fi'
+        type: string
+      version-file:
+        description: 'Path to VERSION file'
+        required: false
+        default: 'VERSION'
+        type: string
+      maintainer-name:
+        description: 'Maintainer name for debian/changelog'
+        required: false
+        default: 'Hat Labs'
+        type: string
+      maintainer-email:
+        description: 'Maintainer email for debian/changelog'
+        required: false
+        default: 'info@hatlabs.fi'
+        type: string
+      runs-on:
+        description: 'Runner to use'
+        required: false
+        default: 'ubuntu-latest'
+        type: string
+      skip-tests:
+        description: 'Skip test job'
+        required: false
+        default: false
+        type: boolean
+      run-lintian:
+        description: 'Run lintian checks on built packages (backstop for container-packaging-tools repos)'
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      APT_REPO_PAT:
+        description: 'PAT for dispatching to APT repository'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    if: ${{ !inputs.skip-tests }}
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run tests
+        uses: ./.github/actions/run-tests
+
+  build-and-release:
+    needs: [test]
+    if: ${{ always() && (needs.test.result == 'success' || inputs.skip-tests) }}
+    runs-on: ${{ inputs.runs-on }}
+    env:
+      PACKAGE_NAME: ${{ inputs.package-name }}
+      APT_DISTRO: ${{ inputs.apt-distro }}
+      APT_COMPONENT: ${{ inputs.apt-component }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version from VERSION file
+        id: version
+        run: |
+          UPSTREAM_VERSION=$(cat "${{ inputs.version-file }}")
+          echo "upstream=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
+          echo "Upstream version: $UPSTREAM_VERSION"
+
+      - name: Calculate revision number
+        id: revision
+        run: |
+          # Calculate the next revision number for a given upstream version
+          # Finds all git tags matching v<upstream-version>+<N> or v<upstream-version>+<N>_pre
+          # Returns the next N value (highest N + 1), or 1 if no matching tags exist
+
+          UPSTREAM_VERSION="${{ steps.version.outputs.upstream }}"
+
+          # Remove 'v' prefix if present
+          UPSTREAM_VERSION="${UPSTREAM_VERSION#v}"
+
+          # Find all tags matching the pattern: v{version}+{N} or v{version}+{N}_pre
+          PATTERN="v${UPSTREAM_VERSION}+*"
+          MATCHING_TAGS=$(git tag -l "$PATTERN" 2>/dev/null || true)
+
+          if [ -z "$MATCHING_TAGS" ]; then
+            # No matching tags, this is the first build
+            echo "revision=1" >> $GITHUB_OUTPUT
+            echo "Revision number: 1 (first build for this version)"
+            exit 0
+          fi
+
+          # Extract revision numbers from tags and find max
+          MAX_REVISION=0
+          while IFS= read -r tag; do
+            # Extract the number between '+' and either end of string or '_'
+            if [[ $tag =~ \+([0-9]+)(_.*)?$ ]]; then
+              REVISION="${BASH_REMATCH[1]}"
+              if [ "$REVISION" -gt "$MAX_REVISION" ]; then
+                MAX_REVISION="$REVISION"
+              fi
+            fi
+          done <<< "$MATCHING_TAGS"
+
+          # Return next revision number
+          NEXT_REVISION=$((MAX_REVISION + 1))
+          echo "revision=$NEXT_REVISION" >> $GITHUB_OUTPUT
+          echo "Revision number: $NEXT_REVISION"
+
+      - name: Generate debian/changelog
+        run: |
+          UPSTREAM="${{ steps.version.outputs.upstream }}"
+          REVISION="${{ steps.revision.outputs.revision }}"
+
+          # Check for local script override
+          if [ -f ".github/scripts/generate-changelog.sh" ]; then
+            echo "Using local generate-changelog.sh script"
+            .github/scripts/generate-changelog.sh \
+              --upstream "$UPSTREAM" \
+              --revision "$REVISION"
+          else
+            # Default: single package with debian/ at root
+            echo "Using default changelog generation"
+            DEBIAN_VERSION="${UPSTREAM}-${REVISION}"
+            DISTRIBUTION="unstable"
+            URGENCY="medium"
+            DATE=$(date -R)
+
+            # Get recent changes from git log
+            LAST_TAG=$(git tag -l "v*" --sort=-version:refname | grep -v "_pre" | head -n1 || echo "")
+
+            if [ -n "$LAST_TAG" ]; then
+              CHANGES=$(git log "${LAST_TAG}"..HEAD --pretty=format:"  * %s" --no-merges -- || echo "  * Build ${REVISION}")
+            else
+              CHANGES=$(git log -10 --pretty=format:"  * %s" --no-merges || echo "  * Build ${REVISION}")
+            fi
+
+            if [ -z "$CHANGES" ]; then
+              CHANGES="  * Build ${REVISION}"
+            fi
+
+            # Generate debian/changelog entry
+            cat > debian/changelog <<CHANGELOG_EOF
+          ${{ inputs.package-name }} (${DEBIAN_VERSION}) ${DISTRIBUTION}; urgency=${URGENCY}
+
+          ${CHANGES}
+
+           -- ${{ inputs.maintainer-name }} <${{ inputs.maintainer-email }}>  ${DATE}
+          CHANGELOG_EOF
+
+            # Remove leading whitespace from heredoc
+            sed -i 's/^          //' debian/changelog
+
+            echo "Generated debian/changelog:"
+            cat debian/changelog
+          fi
+
+      - name: Set version variables
+        id: versions
+        run: |
+          UPSTREAM="${{ steps.version.outputs.upstream }}"
+          REVISION="${{ steps.revision.outputs.revision }}"
+          DEBIAN_VERSION="${UPSTREAM}-${REVISION}"
+          PRERELEASE_TAG="v${UPSTREAM}+${REVISION}_pre"
+          STABLE_TAG="v${UPSTREAM}+${REVISION}"
+
+          echo "debian_version=$DEBIAN_VERSION" >> $GITHUB_OUTPUT
+          echo "prerelease_tag=$PRERELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "stable_tag=$STABLE_TAG" >> $GITHUB_OUTPUT
+
+          echo "Debian version: $DEBIAN_VERSION"
+          echo "Pre-release tag: $PRERELEASE_TAG"
+          echo "Stable tag: $STABLE_TAG"
+
+      - name: Check if pre-release exists
+        id: check
+        run: |
+          TAG="${{ steps.versions.outputs.prerelease_tag }}"
+          if gh release view "$TAG" &>/dev/null; then
+            echo "action=skip" >> $GITHUB_OUTPUT
+            echo "Pre-release $TAG already exists, skipping"
+          else
+            echo "action=create" >> $GITHUB_OUTPUT
+            echo "Pre-release $TAG does not exist, will create"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Build .deb package
+        if: steps.check.outputs.action == 'create'
+        uses: ./.github/actions/build-deb
+
+      - name: Run lintian checks
+        if: steps.check.outputs.action == 'create' && inputs.run-lintian
+        run: |
+          echo "Installing lintian..."
+          sudo apt-get update && sudo apt-get install -y lintian
+
+          echo "Running lintian on built packages..."
+          failed=0
+          for deb in *.deb; do
+            if [ -f "$deb" ]; then
+              echo ""
+              echo "=== Checking: $deb ==="
+              # Run lintian with informational output, fail on errors and warnings
+              if ! lintian --info --display-info --fail-on error,warning "$deb"; then
+                failed=1
+              fi
+            fi
+          done
+          if [ $failed -eq 1 ]; then
+            echo ""
+            echo "❌ Lintian found issues. See above for details."
+            echo "To suppress specific tags, create debian/<package>.lintian-overrides"
+            exit 1
+          fi
+          echo ""
+          echo "✅ Lintian checks passed"
+
+      - name: Rename packages with distro+component suffix
+        if: steps.check.outputs.action == 'create'
+        run: |
+          DEBIAN_VERSION="${{ steps.versions.outputs.debian_version }}"
+
+          # Check for local script override
+          if [ -f ".github/scripts/rename-packages.sh" ]; then
+            echo "Using local rename-packages.sh script"
+            .github/scripts/rename-packages.sh \
+              --version "$DEBIAN_VERSION" \
+              --distro "$APT_DISTRO" \
+              --component "$APT_COMPONENT"
+          else
+            # Default: single package
+            OLD_NAME="${PACKAGE_NAME}_${DEBIAN_VERSION}_all.deb"
+            NEW_NAME="${PACKAGE_NAME}_${DEBIAN_VERSION}_all+${APT_DISTRO}+${APT_COMPONENT}.deb"
+
+            if [ -f "$OLD_NAME" ]; then
+              echo "Renaming package: $(basename $OLD_NAME) -> $(basename $NEW_NAME)"
+              mv "$OLD_NAME" "$NEW_NAME"
+              echo "Package renamed successfully"
+            else
+              echo "Error: Expected package not found: $OLD_NAME"
+              echo "Available .deb files:"
+              ls -la *.deb 2>/dev/null || echo "None found"
+              exit 1
+            fi
+          fi
+
+      - name: Generate pre-release notes
+        if: steps.check.outputs.action == 'create'
+        run: |
+          DEBIAN_VERSION="${{ steps.versions.outputs.debian_version }}"
+          TAG_VERSION="${{ steps.versions.outputs.prerelease_tag }}"
+
+          # Check for local script override
+          if [ -f ".github/scripts/generate-release-notes.sh" ]; then
+            echo "Using local generate-release-notes.sh script"
+            .github/scripts/generate-release-notes.sh \
+              "$DEBIAN_VERSION" \
+              "$TAG_VERSION" \
+              prerelease
+          else
+            # Default release notes
+            SHORT_SHA="${GITHUB_SHA:0:7}"
+
+            # Get changelog since last published release
+            LAST_TAG=$(gh release list --limit 100 --json tagName,isPrerelease,isDraft \
+              --jq '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName' | head -n1 || true)
+
+            if [ -n "$LAST_TAG" ]; then
+              CHANGELOG=$(git log "${LAST_TAG}"..HEAD --pretty=format:"- %s (%h)" --no-merges -- || echo "- Build ${DEBIAN_VERSION}")
+            else
+              CHANGELOG=$(git log -10 --pretty=format:"- %s (%h)" --no-merges)
+            fi
+
+            cat > release_notes.md <<NOTES_EOF
+          ## ${{ inputs.package-name }} ${TAG_VERSION} (Pre-release)
+
+          > **This is a pre-release build from the main branch. Use for testing only.**
+
+          **Build Information:**
+          - Commit: ${SHORT_SHA} (\`${GITHUB_SHA}\`)
+          - Built: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          ### Recent Changes
+
+          ${CHANGELOG}
+
+          ### Installation
+
+          To install this pre-release:
+
+          \`\`\`bash
+          # Add HaLOS repository (if not already added)
+          curl -fsSL https://apt.halos.fi/halos-apt-key.asc | sudo gpg --dearmor -o /usr/share/keyrings/halos.gpg
+
+          # Add unstable channel
+          echo "deb [signed-by=/usr/share/keyrings/halos.gpg] https://apt.halos.fi trixie-unstable main" | sudo tee /etc/apt/sources.list.d/halos-unstable.list
+
+          # Update and install
+          sudo apt update
+          sudo apt install ${{ inputs.package-name }}
+          \`\`\`
+          NOTES_EOF
+
+            # Remove leading whitespace from heredoc
+            sed -i 's/^          //' release_notes.md
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create pre-release
+        if: steps.check.outputs.action == 'create'
+        run: |
+          PRERELEASE_TAG="${{ steps.versions.outputs.prerelease_tag }}"
+          if ! ls *.deb 1> /dev/null 2>&1; then
+            echo "Error: No .deb files found"
+            exit 1
+          fi
+          echo "Creating pre-release $PRERELEASE_TAG"
+          gh release create "$PRERELEASE_TAG" \
+            --prerelease \
+            --title "$PRERELEASE_TAG (Pre-release)" \
+            --notes-file release_notes.md \
+            *.deb
+          echo "Pre-release created successfully"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Generate draft release notes
+        if: steps.check.outputs.action == 'create'
+        run: |
+          DEBIAN_VERSION="${{ steps.versions.outputs.debian_version }}"
+          STABLE_TAG="${{ steps.versions.outputs.stable_tag }}"
+
+          # Check for local script override
+          if [ -f ".github/scripts/generate-release-notes.sh" ]; then
+            echo "Using local generate-release-notes.sh script"
+            .github/scripts/generate-release-notes.sh \
+              "$DEBIAN_VERSION" \
+              "$STABLE_TAG" \
+              draft
+          else
+            # Default release notes
+            # Get changelog since last published release
+            LAST_TAG=$(gh release list --limit 100 --json tagName,isPrerelease,isDraft \
+              --jq '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName' | head -n1 || true)
+
+            if [ -n "$LAST_TAG" ]; then
+              CHANGELOG=$(git log "${LAST_TAG}"..HEAD --pretty=format:"- %s (%h)" --no-merges -- || echo "- Release ${DEBIAN_VERSION}")
+            else
+              CHANGELOG=$(git log -10 --pretty=format:"- %s (%h)" --no-merges)
+            fi
+
+            cat > release_notes.md <<NOTES_EOF
+          ## ${{ inputs.package-name }} v${DEBIAN_VERSION}
+
+          ${{ inputs.package-description }}
+
+          ### Changes
+
+          ${CHANGELOG}
+
+          ### Installation
+
+          Available from [apt.halos.fi](https://apt.halos.fi):
+
+          \`\`\`bash
+          sudo apt update
+          sudo apt install ${{ inputs.package-name }}
+          \`\`\`
+          NOTES_EOF
+
+            # Remove leading whitespace from heredoc
+            sed -i 's/^          //' release_notes.md
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Delete previous draft releases
+        if: steps.check.outputs.action == 'create'
+        run: |
+          echo "Cleaning up previous draft releases..."
+          # List all draft releases and delete them
+          DRAFT_RELEASES=$(gh release list --limit 100 --json tagName,isDraft --jq '.[] | select(.isDraft == true) | .tagName')
+
+          if [ -z "$DRAFT_RELEASES" ]; then
+            echo "No draft releases to clean up"
+          else
+            while IFS= read -r tag; do
+              echo "Deleting draft release: $tag"
+              gh release delete "$tag" --yes
+            done <<< "$DRAFT_RELEASES"
+            echo "Draft releases cleaned up"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create draft stable release
+        if: steps.check.outputs.action == 'create'
+        run: |
+          STABLE_TAG="${{ steps.versions.outputs.stable_tag }}"
+
+          # Check if stable release already exists
+          if gh release view "$STABLE_TAG" &>/dev/null; then
+            echo "Release $STABLE_TAG already exists, skipping creation"
+          else
+            echo "Creating draft release $STABLE_TAG with .deb package"
+            gh release create "$STABLE_TAG" \
+              --draft \
+              --title "$STABLE_TAG" \
+              --notes-file release_notes.md \
+              *.deb
+            echo "Draft release created successfully with .deb attached"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Dispatch to APT repository
+        if: steps.check.outputs.action == 'create'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.APT_REPO_PAT }}
+          repository: ${{ inputs.apt-repository }}
+          event-type: package-updated
+          client-payload: |
+            {
+              "repository": "${{ github.repository }}",
+              "distro": "${{ inputs.apt-distro }}",
+              "channel": "unstable",
+              "component": "${{ inputs.apt-component }}"
+            }
+
+      - name: Report success
+        if: steps.check.outputs.action == 'create'
+        run: |
+          DEBIAN_VERSION="${{ steps.versions.outputs.debian_version }}"
+          PRERELEASE_TAG="${{ steps.versions.outputs.prerelease_tag }}"
+          STABLE_TAG="${{ steps.versions.outputs.stable_tag }}"
+          echo "=== Main Branch CI/CD Complete ==="
+          echo "Package: ${{ inputs.package-name }}"
+          echo "Debian version: ${DEBIAN_VERSION}"
+          echo "Pre-release tag: ${PRERELEASE_TAG}"
+          echo "Stable tag (draft): ${STABLE_TAG}"
+          echo "Pre-release URL: https://github.com/${{ github.repository }}/releases/tag/${PRERELEASE_TAG}"
+          echo "Draft URL: https://github.com/${{ github.repository }}/releases/tag/${STABLE_TAG}"
+          echo ""
+          echo "Pre-release created with .deb package"
+          echo "Draft release created with .deb attached"
+          echo "Dispatched to ${{ inputs.apt-repository }} unstable channel"
+          echo ""
+          echo "To publish stable release:"
+          echo "  1. Test the unstable package"
+          echo "  2. Publish the draft release in GitHub UI"
+          echo "  3. release.yml will dispatch to stable channel"
